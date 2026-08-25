@@ -4,13 +4,18 @@
 
 ## Package
 
-- Version: `0.1.1`
+- Version: `0.1.2`
 - Image target: `/R4OS/SOFTWARE/TERMINAL/DIAG/USBDIAG.R4X`
 - Image scope: `test`
 - Canonical project manifest: `module.R4MF`
 
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
+
+The default protocol suite validates HID, BOT and USB SCSI dispatch,
+including 4Kn READ/WRITE(16) CDBs and a READ CAPACITY(16) result beyond the
+32-bit LBA boundary. `/READSTRESS` retains the repeated file checksum gate for
+an attached USB mass-storage path.
 
 ## Build
 

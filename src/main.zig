@@ -215,8 +215,36 @@ const App = struct {
     fn checkScsiBlock(self: *App) bool {
         var op: r4os.abi.UsbScsiBlockOp = .{};
         const rc = self.dispatch("usb.scsi_block", r4os.abi.usb_scsi_op_self_test, r4os.abi.UsbScsiBlockOp, &op);
-        const ok = rc == r4os.abi.usb_scsi_result_ok and op.result == r4os.abi.usb_scsi_result_ok;
+        var ok = rc == r4os.abi.usb_scsi_result_ok and op.result == r4os.abi.usb_scsi_result_ok;
         self.printDispatch("scsi-block", ok, rc, op.result);
+
+        op = .{
+            .lba64 = 0x0000_0001_2345_6789,
+            .block_count = 4,
+            .logical_block_size = 4096,
+        };
+        const read16_rc = self.dispatch("usb.scsi_block", r4os.abi.usb_scsi_op_build_read16, r4os.abi.UsbScsiBlockOp, &op);
+        const read16_ok = read16_rc == 0 and op.result == 0 and op.cdb[0] == 0x88 and op.cdb_len == 16 and op.transfer_len == 16384;
+        self.printDispatch("scsi-read16-4kn", read16_ok, read16_rc, op.result);
+        ok = read16_ok and ok;
+
+        op = .{
+            .lba64 = 0x0000_0002_3456_789A,
+            .block_count = 2,
+            .logical_block_size = 4096,
+        };
+        const write16_rc = self.dispatch("usb.scsi_block", r4os.abi.usb_scsi_op_build_write16, r4os.abi.UsbScsiBlockOp, &op);
+        const write16_ok = write16_rc == 0 and op.result == 0 and op.cdb[0] == 0x8A and op.cdb_len == 16 and op.transfer_len == 8192 and op.direction == r4os.abi.usb_scsi_dir_out;
+        self.printDispatch("scsi-write16-4kn", write16_ok, write16_rc, op.result);
+        ok = write16_ok and ok;
+
+        op = .{ .allocation_len = 32 };
+        writeBe64(op.data[0..8], 0x0000_0001_0000_0000);
+        writeBe32(op.data[8..12], 4096);
+        const capacity16_rc = self.dispatch("usb.scsi_block", r4os.abi.usb_scsi_op_parse_capacity16, r4os.abi.UsbScsiBlockOp, &op);
+        const capacity16_ok = capacity16_rc == 0 and op.result == 0 and op.sector_count == 0x0000_0001_0000_0001 and op.sector_size == 4096 and op.capacity_format == 16;
+        self.printDispatch("scsi-capacity16-4kn", capacity16_ok, capacity16_rc, op.result);
+        ok = capacity16_ok and ok;
         return ok;
     }
 
@@ -316,6 +344,18 @@ fn checksumUpdate(seed: u64, bytes: []const u8) u64 {
         checksum *%= fnv1a_prime;
     }
     return checksum;
+}
+
+fn writeBe32(out: []u8, value: u32) void {
+    out[0] = @truncate(value >> 24);
+    out[1] = @truncate(value >> 16);
+    out[2] = @truncate(value >> 8);
+    out[3] = @truncate(value);
+}
+
+fn writeBe64(out: []u8, value: u64) void {
+    writeBe32(out[0..4], @truncate(value >> 32));
+    writeBe32(out[4..8], @truncate(value));
 }
 
 fn copyZ(out: [:0]u8, value: []const u8) ?[*:0]const u8 {
