@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.2`
+- Version: `0.1.3`
 - Image target: `/R4OS/SOFTWARE/TERMINAL/DIAG/USBDIAG.R4X`
 - Image scope: `test`
 - Canonical project manifest: `module.R4MF`
