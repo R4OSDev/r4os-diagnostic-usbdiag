@@ -1,3 +1,4 @@
+const std = @import("std");
 const r4os = @import("r4os");
 
 const read_stress_default_passes: u32 = 8;
@@ -13,11 +14,15 @@ const ReadStressOptions = struct {
 };
 
 const App = struct {
+    app: *r4os.App2,
+    files: r4os.Files,
     sys: r4os.r4sys.Context,
     dev: r4os.r4dev.Context,
 
-    fn init(r4_app: *r4os.App) ?App {
+    fn init(r4_app: *r4os.App2) ?App {
         return .{
+            .app = r4_app,
+            .files = r4_app.files() orelse return null,
             .sys = r4_app.system(),
             .dev = r4_app.devicesLowLevel() orelse return null,
         };
@@ -43,32 +48,46 @@ const App = struct {
 
     fn runReadStress(self: *App, options: ReadStressOptions) i32 {
         var path_buffer: [read_stress_max_path:0]u8 = .{0} ** read_stress_max_path;
-        const path = copyZ(path_buffer[0..], options.path) orelse {
+        _ = copyZ(path_buffer[0..], options.path) orelse {
             self.sys.println("USBDIAG read-stress error: path-too-long");
             self.sys.println("USBDIAG read-stress result: FAILED");
             return 1;
         };
 
-        const info = self.sys.fileInfo(path) orelse {
-            self.sys.println("USBDIAG read-stress error: file-not-found");
-            self.sys.println("USBDIAG read-stress result: FAILED");
+        const file_path = r4os.FilePath.parse(options.path) catch {
+            self.sys.println("USBDIAG read-stress error: invalid-path");
             return 1;
         };
-        if (info.is_dir != 0) {
+        const metadata = switch (self.files.metadata(file_path.asZ())) {
+            .found => |value| value,
+            .missing => {
+                self.sys.println("USBDIAG read-stress error: file-not-found");
+                return 1;
+            },
+            .failure => {
+                self.sys.println("USBDIAG read-stress error: metadata-unavailable");
+                return 1;
+            },
+        };
+        if (metadata.flags & r4os.abi.file_metadata2_flag_directory != 0) {
             self.sys.println("USBDIAG read-stress error: path-is-directory");
-            self.sys.println("USBDIAG read-stress result: FAILED");
             return 1;
         }
-        if (info.size > 0xffff_ffff) {
-            self.sys.println("USBDIAG read-stress error: file-too-large-for-fileReadAt");
-            self.sys.println("USBDIAG read-stress result: FAILED");
+        const size = r4os.metadata2.fileSize(&metadata) orelse {
+            self.sys.println("USBDIAG read-stress error: file-size-unavailable");
+            return 1;
+        };
+        // The shared borrowed path reader has an explicit u32 offset range.
+        // Keep the original limit; counters and the transfer offset stay u64.
+        if (size > std.math.maxInt(u32) or size > std.math.maxInt(u64) / @as(u64, options.passes)) {
+            self.sys.println("USBDIAG read-stress error: file-too-large-for-path-reader");
             return 1;
         }
 
         self.sys.write("USBDIAG read-stress start path=");
         self.sys.write(options.path);
         self.sys.write(" size=");
-        self.sys.printU64(info.size);
+        self.sys.printU64(size);
         self.sys.write(" passes=");
         self.sys.printU64(options.passes);
         self.sys.write(" chunk=");
@@ -78,7 +97,7 @@ const App = struct {
         var reference_checksum: ?u64 = null;
         var pass: u32 = 1;
         while (pass <= options.passes) : (pass += 1) {
-            const result = self.readStressPass(path, info.size);
+            const result = self.readStressPass(file_path.asZ().ptr, size);
             const checksum_matches = if (reference_checksum) |expected| result.checksum == expected else true;
             const pass_ok = result.ok and checksum_matches;
 
@@ -115,7 +134,7 @@ const App = struct {
         self.sys.write("USBDIAG read-stress summary passes=");
         self.sys.printU64(options.passes);
         self.sys.write(" bytes=");
-        self.sys.printU64(info.size * options.passes);
+        self.sys.printU64(size * options.passes);
         self.sys.write(" checksum=");
         self.sys.printU64(reference_checksum orelse fnv1a_offset_basis);
         self.sys.println("");
@@ -133,33 +152,23 @@ const App = struct {
 
     fn readStressPass(self: *App, path: [*:0]const u8, size: u64) ReadStressPassResult {
         var buffer: [read_stress_chunk_size]u8 = undefined;
-        var offset: u64 = 0;
+        var clock = self.app.clock() catch return .{ .ok = false, .bytes = 0, .checksum = fnv1a_offset_basis, .read_result = r4os.abi.err_no_fn, .expected = 0 };
+        const budget = r4os.rpc_budget.Budget.fromTimeout(clock.read, .{ .kind = r4os.abi.timeout_kind_finite, .nanoseconds = 30_000_000_000 }) catch return .{ .ok = false, .bytes = 0, .checksum = fnv1a_offset_basis, .read_result = r4os.abi.err_no_fn, .expected = 0 };
+        var source = r4os.stream_transfer.adapters.FileRead.fromContext2(self.sys.base.generation2.?, path, 0) catch return .{ .ok = false, .bytes = 0, .checksum = fnv1a_offset_basis, .read_result = r4os.abi.err_no_fn, .expected = 0 };
+        var transfer = r4os.stream_transfer.Transfer.initAbsolute(.read_exact, size, budget.deadline) catch unreachable;
         var checksum = fnv1a_offset_basis;
-
-        while (offset < size) {
-            const want: usize = @intCast(@min(@as(u64, buffer.len), size - offset));
-            const read = self.sys.fileReadAt(path, @intCast(offset), buffer[0..want]);
-            if (read <= 0 or read > @as(i32, @intCast(want))) {
-                return .{
-                    .ok = false,
-                    .bytes = offset,
-                    .checksum = checksum,
-                    .read_result = read,
-                    .expected = want,
-                };
-            }
-            const read_len: usize = @intCast(read);
-            checksum = checksumUpdate(checksum, buffer[0..read_len]);
-            offset += read_len;
+        while (true) {
+            const progress = transfer.readStep(&buffer, read_stress_chunk_size, self.app.shouldClose(), r4os.stream_transfer.adapters.PlatformClock.sample, &clock, r4os.stream_transfer.adapters.FileRead.step, &source) catch return .{ .ok = false, .bytes = transfer.bytes, .checksum = checksum, .read_result = r4os.abi.file_stream_error_io, .expected = 0 };
+            checksum = checksumUpdate(checksum, buffer[0..progress.last_bytes]);
+            if (progress.flags & r4os.stream_transfer.core.terminal != 0) return .{
+                .ok = progress.outcome == @intFromEnum(r4os.stream_transfer.Outcome.complete) and progress.bytes == size,
+                .bytes = progress.bytes,
+                .checksum = checksum,
+                .read_result = progress.error_code,
+                .expected = @intCast(@min(size - progress.bytes, buffer.len)),
+            };
+            if (progress.outcome == @intFromEnum(r4os.stream_transfer.Outcome.would_block)) self.sys.sleepTicks(1);
         }
-
-        return .{
-            .ok = true,
-            .bytes = offset,
-            .checksum = checksum,
-            .read_result = 0,
-            .expected = 0,
-        };
     }
 
     fn checkApi(self: *App) bool {
@@ -279,50 +288,34 @@ const App = struct {
     }
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
     var app = App.init(r4_app) orelse return r4os.abi.err_no_group;
-    const args = trim(r4_app.args());
-    if (args.len != 0) {
-        const options = parseReadStressOptions(args) orelse {
-            app.sys.println("Usage: USBDIAG.R4X /READSTRESS PATH [PASSES]");
-            app.sys.println("       PASSES must be between 1 and 64 (default 8).");
-            app.sys.println("USBDIAG read-stress result: FAILED");
-            return 1;
-        };
+    const args = r4_app.args();
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = r4_app.argCursor(.{ .quotes = 0, .max_bytes = 4096 }, &failure) catch return usage(&app);
+    const command = cursor.next() catch return usage(&app);
+    if (command) |token| {
+        const options = parseReadStressOptions(&cursor, args, token) orelse return usage(&app);
         return app.runReadStress(options);
     }
     return app.run();
 }
 
-fn parseReadStressOptions(args: []const u8) ?ReadStressOptions {
-    const command = takeToken(args) orelse return null;
-    if (!equalsIgnoreCase(command.token, "/READSTRESS")) return null;
-
-    const path = takeToken(command.rest) orelse return null;
-    if (path.rest.len == 0) {
-        return .{ .path = path.token, .passes = read_stress_default_passes };
-    }
-
-    const passes = takeToken(path.rest) orelse return null;
-    if (passes.rest.len != 0) return null;
-    const count = parsePasses(passes.token) orelse return null;
-    return .{ .path = path.token, .passes = count };
+fn usage(app: *App) i32 {
+    app.sys.println("Usage: USBDIAG.R4X /READSTRESS PATH [PASSES]");
+    app.sys.println("       PASSES must be between 1 and 64 (default 8).");
+    app.sys.println("USBDIAG read-stress result: FAILED");
+    return 1;
 }
 
-const Token = struct {
-    token: []const u8,
-    rest: []const u8,
-};
-
-fn takeToken(value: []const u8) ?Token {
-    const trimmed = trim(value);
-    if (trimmed.len == 0) return null;
-    var end: usize = 0;
-    while (end < trimmed.len and !isSpace(trimmed[end])) : (end += 1) {}
-    return .{
-        .token = trimmed[0..end],
-        .rest = if (end >= trimmed.len) "" else trim(trimmed[end..]),
-    };
+fn parseReadStressOptions(cursor: *r4os.arguments.ArgCursor, args: []const u8, command: r4os.arguments.Token) ?ReadStressOptions {
+    if (!equalsIgnoreCase(command.bytes(args) catch return null, "/READSTRESS")) return null;
+    const path = (cursor.next() catch return null) orelse return null;
+    const path_bytes = path.bytes(args) catch return null;
+    const count_token = (cursor.next() catch return null) orelse return .{ .path = path_bytes, .passes = read_stress_default_passes };
+    const count = parsePasses(count_token.bytes(args) catch return null) orelse return null;
+    if ((cursor.next() catch return null) != null) return null;
+    return .{ .path = path_bytes, .passes = count };
 }
 
 fn parsePasses(value: []const u8) ?u32 {
@@ -363,18 +356,6 @@ fn copyZ(out: [:0]u8, value: []const u8) ?[*:0]const u8 {
     @memcpy(out[0..value.len], value);
     out[value.len] = 0;
     return @ptrCast(out.ptr);
-}
-
-fn trim(value: []const u8) []const u8 {
-    var start: usize = 0;
-    var end = value.len;
-    while (start < end and isSpace(value[start])) : (start += 1) {}
-    while (end > start and isSpace(value[end - 1])) : (end -= 1) {}
-    return value[start..end];
-}
-
-fn isSpace(ch: u8) bool {
-    return ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n';
 }
 
 fn equalsIgnoreCase(a: []const u8, b: []const u8) bool {

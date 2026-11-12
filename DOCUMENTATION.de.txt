@@ -24,3 +24,8 @@ Build unter Linux:
 
 Das Artefakt wird gemaess `module.R4MF` als `USBDIAG.R4X` fuer
 `C:\R4OS\SOFTWARE\TERMINAL\DIAG\USBDIAG.R4X` gebaut.
+
+Generation2 seit0.90.81 / Modul 0.1.6:
+Echter App2-Einstieg und R4XStart2:2, ausschliesslich Query2:2-Imports.
+Gemeinsame SDK-Fachhelfer und genaue Fehler-/Frist-/Besitzergrenzen stehen
+in README.md; die urspruenglichen unabhaengigen Fachorakel bleiben erhalten.
